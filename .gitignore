@@ -3,3 +3,13 @@
 *.perspective*
 .DS_Store
 build
+
+# Port build artifacts and scratch files
+*.dylib
+*.so
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+Untitled*.ipynb
+jupyter.out
+Runs/
