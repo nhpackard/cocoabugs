@@ -13,3 +13,6 @@ __pycache__/
 Untitled*.ipynb
 jupyter.out
 Runs/
+
+# Claude Code per-machine settings
+.claude/settings.local.json
