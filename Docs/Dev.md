@@ -197,3 +197,107 @@ Renamed the existing whole-genome FNV-1a content-hash probe to **G-activity**
   `+1` per live bug per tick for *the slot the bug uses this tick*. Distinct
   genomes that share a motif contribute to the same bucket. `Σ g_pop_count
   == population` still holds.
+
+## Session — 2026-04-21 — egenome (per-position food thresholds)
+
+User request: replace the scalar `food_threshold` with a length-9 per-
+Moore-position vector — the *egenome*, by analogy with EvoCA. Each bug
+carries its own egenome; at birth the child's egenome is the parent's
+plus i.i.d. truncated-Gaussian drift per entry with width `mu_egenome`
+(clipped to `[0, 1]`). With `mu_egenome = 0` children copy exactly; with
+`mu_egenome > 0` perception itself evolves.
+
+Clarifications from the user:
+1. Eliminate the scalar `food_threshold` (and its slider) entirely.
+   Introduce `egenome_init` as an API-only metaparam (no GUI), plus
+   helpers: `egenome_center_only`, `egenome_constant`, `egenome_random`.
+2. Inheritance at birth: Gaussian drift only — no separate mutation rate.
+3. Keep the egenome *out* of the G-content hash (so G-activity still
+   tracks the 512-gene content, not perception).
+4. Add a probe window: 9 translucent colored bands, centerlines at the
+   per-position population mean, band half-width = population std.
+
+Changes:
+
+- `Bugs/C/bugs.h`:
+  - New `#define EGENOME_N 9`.
+  - Removed `bugs_set_food_threshold` / `bugs_get_food_threshold`.
+  - Added: `bugs_set_mu_egenome`, `bugs_get_mu_egenome`,
+    `bugs_set_egenome_init(const float *)`, `bugs_get_egenome_init(float *)`,
+    `bugs_egenome_stats(float *mean, float *std)` (length EGENOME_N).
+- `Bugs/C/bugs.c`:
+  - Per-bug `float egenome[9]` on `bug_t`.
+  - Globals: `g_mu_egenome = 0`, `g_egenome_init[9] = {0.1, …, 0.1}`.
+  - `rng_gauss()` Box-Muller helper.
+  - `neighborhood_gene()` rewritten to take `const bug_t *b` and test
+    `F(neighbor_p) > b->egenome[p]` per position. Two call sites updated.
+  - `egenome_mutate_copy(dst, src, sigma)` — per-entry truncated-Gaussian
+    drift, clipped to `[0, 1]`. Called after `genome_mutate_copy` on birth.
+  - Seeding copies `g_egenome_init` into each new bug's egenome.
+  - `bugs_egenome_stats` uses double accumulators (`var = E[X²]-E[X]²`,
+    clamped ≥0).
+  - Smoke test on C side: center-only egenome → mean[C]=0.5, stds=0 at
+    seed time. Drift accrues with reproduction.
+- `Bugs/python/bugs_py.py`:
+  - `EGENOME_N = 9`. Helpers `egenome_center_only`, `egenome_constant`,
+    `egenome_random`.
+  - `_DEFAULTS`: drop `food_threshold`, add `mu_egenome = 0.0`.
+    `_EGENOME_INIT_DEFAULT` = `[0.1]*9` as a class attribute (non-scalar
+    metaparam handled separately from the scalar-loop defaults).
+  - ctypes bindings for `bugs_set_mu_egenome` / `bugs_get_mu_egenome` /
+    `bugs_set_egenome_init` / `bugs_get_egenome_init` /
+    `bugs_egenome_stats`.
+  - `Bugs.set_egenome_init(v)`, `Bugs.get_egenome_init()`,
+    `Bugs.egenome_stats() → (mean, std)` accessor (both length-9 float32).
+  - `Bugs.init(N, …, egenome_init=…)` accepts the vector and logs it into
+    `_init_metaparams`; `sim.state(…, egenome_init=…)` re-applies at seed
+    time and stores the active value in `_state_params` for recipe export.
+  - `update_mu_egenome` slider-update helper.
+  - `params_str()` prints `egenome_init` with a `# default` annotation
+    when it differs from the class default.
+  - Recipe bumped to `version: 3`. `metaparams_final` carries the
+    `egenome_init` vector. `import_run` migrates legacy v1/v2 recipes:
+    `food_threshold` → `egenome_init = [ft]*9` + `mu_egenome = 0`.
+- `Bugs/python/controls.py`:
+  - Slider `sl_food_threshold` → `sl_mu_egenome` (range 0–0.1, step 0.001).
+  - Added probe name `'egenome'` to `_AVAILABLE_PROBES` (description:
+    "9 translucent position bands (mean ± std)").
+  - Shared memory layout: 4 B cursor + 9× mean float32[PROBE_W] +
+    9× std float32[PROBE_W].
+  - `_record_probes` pulls `sim.egenome_stats()` and writes a column.
+  - On-restart zeroes cursor + buffers. Cleanup unlinks the shm.
+  - `on_save`: writes `probe_egenome.png` with 9 mean lines + translucent
+    mean±std fills, linear Y in `[0,1]`.
+- `Bugs/python/sdl_worker.py`:
+  - `--egenome=<shm>` CLI flag.
+  - `_EG_RGB` — 9-color palette keyed to `[NW, N, NE, W, C, E, SW, S, SE]`.
+  - `_render_egenome(dst, means, stds, cursor)`: software-blends 9 bands
+    onto a float workspace (α = 0.30 for bands, 1.0 for centerlines), adds
+    y = 0.25/0.50/0.75 gridlines, packs back to ARGB int32. Linear Y in
+    `[0, 1]`.
+  - Window title "egenome (mean +/- std, 9 positions)", stacked in
+    between gq-activity and ts. Destroyed + shm closed on exit.
+- `Bugs/Bugs.md`:
+  - Quick-start `sim.init(...)` now shows `mu_egenome`, `egenome_init`,
+    and the three helper imports.
+  - Neighborhood section: bit *p* set iff `F(neighbor_p) > egenome[p]`.
+  - Metaparam table: `food_threshold` row → `mu_egenome` row. New
+    "Egenome (API-only, no slider)" subsection documenting the vector
+    semantics, inheritance rule, and default.
+  - New probes section `### egenome`.
+  - Probe-enable snippet includes `'egenome': True`.
+- `Bugs/test.ipynb`:
+  - §3 params dict: `food_threshold = 0.2` → `mu_egenome = 0.02` +
+    `egenome_init = [0.1]*9`.
+  - New §12 "Egenome — per-position food thresholds with Gaussian drift"
+    demonstrating the three helpers and `sim.egenome_stats()` before/after
+    400 steps of drift.
+
+Smoke tests:
+- C: `clang … -dynamiclib` clean build. Minimal C program confirms
+  `bugs_set_egenome_init` + `bugs_seed_with_density` propagate to every
+  bug's egenome and `bugs_egenome_stats` reports the expected mean/std.
+- Python: `sim.init(..., mu_egenome=0.02)` + `state(egenome_init=
+  egenome_constant(0.1))` + 500 steps → std[C] converges to ~0.02
+  (matching the σ) while mean stays ~0.1 (no systematic drift bias).
+- `controls.py` and `sdl_worker.py` import cleanly.
