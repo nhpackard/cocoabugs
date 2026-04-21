@@ -132,3 +132,68 @@ one): 1 → 2 → 5 → 3 → 4 → 6 → 7.
     on the `r-pentomino` template.
   - §11 recipe v2 round-trip + tampered-`nbhd` recipe raising `ValueError`.
 - `Docs/Dev.md`: this file.
+
+## Session — 2026-04-20
+
+### Task #13–#15 — Split activity probe into G (whole-genome) and g (per LUT-slot)
+
+Bedau/Packard-style activity was a single probe with ambiguous semantics.
+Renamed the existing whole-genome FNV-1a content-hash probe to **G-activity**
+(keeps its symbols in C for churn-avoidance) and added a parallel
+**g-activity** probe keyed on `(9-bit Moore neighborhood, dx, dy)`
+(i.e. the `(input, output)` LUT-slot actually used by a live bug this tick).
+
+- `Bugs/C/bugs.c` + `bugs.h`:
+  - New static hash table `gact_*` parallel to `act_*` (insert/resize/compact).
+  - `g_pair_key(nbhd, dx, dy)` packs 32-bit key: high-bit guard + 9-bit nbhd
+    + (dx+15) + (dy+15); avoids ACT_EMPTY=0 sentinel.
+  - `bugs_g_activity_update` walks live bugs, computes `neighborhood_gene()`,
+    looks up `genes[idx]`, bumps bucket.
+  - Public API mirrors G-activity: `bugs_g_activity_update`,
+    `bugs_g_activity_render_col`, `bugs_g_activity_get`,
+    `bugs_gq_activity_deciles`, `bugs_set_g_act_ymax`, `bugs_get_g_act_ymax`.
+  - `bugs.h` block comment calls out why C symbols stay `bugs_activity_*`.
+- `Bugs/python/bugs_py.py`:
+  - Renamed `activity_update/get_activity/q_activity_deciles` →
+    `G_activity_update/get_G_activity/Gq_activity_deciles` (C-level binding
+    names unchanged).
+  - Added `g_activity_update`, `get_g_activity` (returns `{'key','activity',
+    'pop_count','color'}` — note `key` vs `hash`; `max_n` default 8192 but
+    real populations easily exceed that, pass 200000+ for headless work),
+    `gq_activity_deciles`, `update_g_act_ymax`, `update_G_act_ymax`.
+  - `import_run()` migrates legacy recipes: probe keys `activity` →
+    `G-activity`, `q_activity` → `Gq-activity`. No recipe version bump.
+- `Bugs/python/controls.py`:
+  - `_AVAILABLE_PROBES` split: `G-activity`, `Gq-activity`, `g-activity`,
+    `gq-activity`, plus existing `ts`/`coloring`.
+  - Parallel shm blocks and cursors for all four probes; ymax buttons
+    `G_act_ymax` and `g_act_ymax`.
+  - `_record_probes()` covers all four (with `if not X_enabled: update()`
+    fallbacks so deciles still work without the strip chart enabled).
+  - `on_save` refactored via `_save_deciles()` helper; writes
+    `probe_Gq_activity.png` and `probe_gq_activity.png`.
+  - CLI flags `--G-activity=`, `--Gq-activity=`, `--g-activity=`,
+    `--gq-activity=`.
+- `Bugs/python/sdl_worker.py`:
+  - Factored window creation into `_create_probe_window(title, w, h, label)`
+    — collapses 4 near-identical blocks and calibrates title-bar height
+    once on the first successful window.
+  - 4 probe windows stacked top-down left of main (G, g, Gq, gq) at
+    `ACT_H=2×PROBE_H` / `PROBE_H` respectively.
+  - Shared `_render_q_activity` handles both Gq and gq decile rendering.
+- `Bugs/test.ipynb`:
+  - All probe keys and API calls renamed.
+  - New §8 sub-section "G-activity vs g-activity" showing the distinction:
+    distinct genome count (G) vs distinct `(nbhd, dx, dy)` motif count (g).
+- Smoke-test: N=64, 20 steps, density 0.2 → pop 807, `g['pop_count'].sum()`
+  = 807 (matches), 120 distinct motifs, 807 distinct genome hashes.
+
+### Semantics note
+
+- **G-activity**: counter per whole-genome content hash; bumped by `+1` per
+  live bug per tick (so `Σ G_pop_count == population`). Rediscovery of an
+  extinct genome reuses its bucket — "seeing rediscovery is good."
+- **g-activity**: counter per `(input, output)` LUT-slot pair; bumped by
+  `+1` per live bug per tick for *the slot the bug uses this tick*. Distinct
+  genomes that share a motif contribute to the same bucket. `Σ g_pop_count
+  == population` still holds.
