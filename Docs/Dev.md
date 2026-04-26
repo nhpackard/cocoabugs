@@ -301,3 +301,167 @@ Smoke tests:
   egenome_constant(0.1))` + 500 steps → std[C] converges to ~0.02
   (matching the σ) while mean stays ~0.1 (no systematic drift bias).
 - `controls.py` and `sdl_worker.py` import cleanly.
+
+
+## Session — 2026-04-24 — Channon-style neutral shadow (N-activity)
+
+### Task #1 — Add neutral shadow + N-activity probe to Bugs and EvoCA
+
+Goal: install a calibration shadow that mirrors the real run's demography
+under random selection, and expose an N-activity probe that bucketises the
+shadow's genome content with the same hash as G-activity, so the two
+distributions live in the same magnitude space.
+
+Design (locked before coding, parallel in both projects):
+- Shadow stores full genome content (Bugs: `genome_t`; EvoCA: `LUT_BYTES`)
+  + cached FNV-1a hash. No positions, food, egenome, age, or alive flag.
+- `*_neutral_enable()` seeds the shadow by copying current real genomes /
+  alive-cell LUTs 1:1, so t₀ distributions are identical.
+- Mirror is automatic inside `bugs_step` / `evoca_step` after real
+  `g_births_last` / `g_deaths_last` are tallied. Deaths: uniform-random
+  swap-and-pop. Births: append, parent picked uniformly with replacement,
+  same `genome_mutate_copy` / Poisson-bit-flip mutation as the real run
+  (EvoCA respects `restricted_mu` using the real run's `n_active`).
+- N-activity buckets use the same hash and table pattern as G-activity
+  (`nact_*` parallel to `act_*`, no flux history in v1).
+- For EvoCA, `evoca_step` had no birth/death counters — added globals
+  `g_births_last` / `g_deaths_last` and accessors. Births = every Phase-4
+  reproduction; deaths = tax-deaths + alive-child evictions, so
+  `births - deaths == net Δalive` and the shadow stays population-locked.
+
+Ref: Channon, "Passing the ALife test: Activity statistics classify
+evolution in Geb as unbounded" (ECAL 2001) — §2.2.
+
+Files touched:
+- `cocoabugs/Bugs/C/bugs.h`, `bugs.c`: forward decls for `nact_*` /
+  `neut_*`; `act_reset/free` siblings extended for nact + neut; mirror
+  call appended at end of `bugs_step`; new ~280-line block defining
+  `bugs_neutral_*`, `bugs_n_activity_*`, `bugs_nq_activity_deciles`,
+  `bugs_set/get_n_act_ymax`.
+- `cocoabugs/Bugs/python/bugs_py.py`: ctypes signatures + Python methods
+  `neutral_enable/disable/is_enabled/population`, `N_activity_update`,
+  `get_N_activity`, `Nq_activity_deciles`.
+- `EvoCA/C/evoca.h`, `evoca.c`: same pattern (uses `act_entry_t` already
+  defined in evoca.c). Added `evoca_get_births_last/deaths_last`. Hooked
+  `evoca_init` / `evoca_free` / `evoca_step`.
+- `EvoCA/python/evoca_py.py`: ctypes signatures + Python methods
+  `get_births_last/deaths_last`, `neutral_*`, `n_activity_update`,
+  `get_n_activity`, `nq_activity_deciles`.
+
+Smoke tests:
+- Bugs: 96×96 grid, food_inc=0.05, mu=0.02, 3000 steps. Real pop=792,
+  shadow=761 (small drift from pre-existing `place_or_bump` silent-drop
+  when a moving parent fails to place — not introduced here). G/N
+  activity distributions roughly co-located at this depth.
+- EvoCA: 64×64, GoL LUT, food_inc=0.12, m_scale=0.4, mu_lut=0.001,
+  tax=0.05, 2000 steps. ~1.05M cumulative births/deaths each, shadow
+  tracks real exactly at 4096. G live buckets=415 vs N live=255;
+  G_max_activity=2015 vs N_max_activity=1061. Gq deciles*D = [1,1,2,3,
+  5,8,12,21,40], Nq*D = [0,1,1,2,3,5,9,16,33] — real run consistently
+  ~20% higher across deciles, with a fatter tail. Matches the Channon
+  expectation that adaptive selection produces longer-lived genome
+  lineages than random demography.
+
+Out of scope for v1 (deferred):
+- N-activity flux probe / pop_hist ring buffer (G-activity has one).
+- Shared `act_table.h` header across the two projects — would refactor
+  `act_*` + `gact_*` + `nact_*` into a single reusable struct. Hold
+  off until a third user lands and the API is settled.
+- Render-column wiring into `sdl_worker.py` + `controls.py` for both
+  projects (probes only run from notebook code currently).
+
+Discussion notes:
+- We considered a simpler shadow (no genome, one activity counter per
+  individual = lifespan). Rejected after reading Channon §2.1: per-
+  individual buckets would not share a magnitude space with G-activity
+  and so cannot calibrate the [a₀, a₁] "significant new activity" band
+  in the way the shadow is meant to.
+- For Bugs at default mutation rate (0.02 × 512 ≈ 10 mutations/birth),
+  identical-genome inheritance is rare in either real or shadow, so the
+  G/N distributions don't sharply diverge in short runs. EvoCA with
+  mu_lut=0.001 (~0.25 expected mutations / birth) shows a visible
+  divergence within 2000 steps because identical-LUT inheritance is the
+  norm and selection vs. drift produces clearly different lineage
+  persistences.
+
+
+## Session — 2026-04-25 — Wire N-activity and Nq-activity probes into SDL
+
+### Task #1 — Bugs SDL: add N-activity and Nq-activity windows
+
+Bugs `controls.py`:
+- Registered `'N-activity'` and `'Nq-activity'` in `_AVAILABLE_PROBES`.
+- Allocated `N_activity_shm` (4 B cursor + ACT_H × PROBE_W × 4 B int32) and
+  `Nq_activity_shm` (4 B cursor + 9 × PROBE_W × 4 B float32), parallel to
+  the existing G/Gq blocks.
+- Added `--N-activity=` / `--Nq-activity=` to the `cmd` line.
+- Added `_record_probes` branches that call
+  `sim._lib.bugs_n_activity_update`, `bugs_n_activity_render_col`, and
+  `bugs_nq_activity_deciles` and write into the shm buffers.
+- Added `_save_deciles("Nq_activity", ...)` to `on_save`.
+- `on_restart` zeros the new buffers and re-attaches the neutral shadow
+  (`bugs_init` frees it; we rebuild with `sim.neutral_enable()`).
+- If either N-probe is enabled at startup, `sim.neutral_enable()` is called
+  once before the SDL subprocess launches.
+
+Bugs `sdl_worker.py`:
+- Parses `--N-activity=` / `--Nq-activity=`, opens the shms via the
+  existing `_open_activity_shm` and `_open_deciles_shm` helpers.
+- Creates two new windows (titles: `N-activity (shadow)` / `Nq-activity
+  (shadow)`), stacked between Gq and g for visual comparison with the
+  real-run probes above and below. Render path scrolls the int32 strip
+  via `np.roll` (same as G), and uses `_render_q_activity` for the
+  decile lines (same as Gq).
+
+### Task #2 — EvoCA SDL: add n_activity and nq_activity windows
+
+EvoCA `controls.py`:
+- Registered `'n_activity'` and `'nq_activity'` in `_AVAILABLE_PROBES`.
+- Allocated parallel shms (same layouts as Bugs).
+- Wired `--n-activity=` / `--nq-activity=` to the cmd line.
+- `_record_probes` writes a column per tick using `evoca_n_activity_*`
+  and `evoca_nq_activity_deciles`.
+- `on_restart` zeros buffers and re-attaches the neutral shadow.
+- `sim.neutral_enable()` called once at session start when probes on.
+
+EvoCA `sdl_worker.py`:
+- Parses `--n-activity=` / `--nq-activity=` (lower-case to match the
+  project's existing convention).
+- Opens the two shms, creates two SDL windows (titles `n_activity
+  (shadow)` / `nq_activity (shadow)`) in the existing inline-creation
+  style. Placed right after the q_activity window in the vertical stack.
+- Render loop scrolls the strip and renders deciles via the existing
+  `_render_q_activity` helper.
+- Cleanup destroys both new windows and closes their shms.
+
+Smoke tests:
+- `python3 -c "import controls; print(available_probes())"` for both
+  projects — both now list the new probe names alongside existing ones.
+- Bugs probes registry: `['G-activity', 'Gq-activity', 'N-activity',
+  'Nq-activity', 'g-activity', 'gq-activity', 'egenome', 'ts',
+  'coloring']`.
+- EvoCA probes registry now includes `'n_activity'` and `'nq_activity'`
+  immediately after `'q_activity'`.
+
+Files touched:
+- `cocoabugs/Bugs/python/controls.py`
+- `cocoabugs/Bugs/python/sdl_worker.py`
+- `EvoCA/python/controls.py`
+- `EvoCA/python/sdl_worker.py`
+
+How to use (notebook, Bugs):
+```python
+sim = Bugs(); sim.init(N=96, …); sim.set_food_source(...);
+sim.seed_with_density(0.3)
+run_with_controls(sim, probes={'G-activity': True, 'Gq-activity': True,
+                               'N-activity': True, 'Nq-activity': True})
+```
+The N/Nq windows render the Channon shadow's whole-genome activity
+distribution and its decile profile alongside G/Gq from the real run.
+EvoCA: same, but probe keys are `'n_activity'` / `'nq_activity'`.
+
+Out of scope (deferred):
+- N-activity flux probe + ring buffer (G-activity has one in C; not yet
+  built for the shadow).
+- A combined "G vs N" overlay panel (current design renders the two as
+  separate strip charts in the stack).
